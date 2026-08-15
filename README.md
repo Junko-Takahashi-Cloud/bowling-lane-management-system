@@ -169,7 +169,7 @@ PATCH /api/v1/class_sessions/{session_id}/lane-pair
 ## User用予約変更API
 
 ```text
-PATCH /api/v1/reservations/{reservation_id}
+PATCH /reservations/{reservation_id}
 ```
 
 予約した本人、または管理者（`admin`）が利用します。
