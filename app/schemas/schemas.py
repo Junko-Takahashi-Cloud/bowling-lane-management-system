@@ -1,9 +1,5 @@
 """
 Pydanticスキーマ（API境界のバリデーション）
-
-DB側のCHECK制約と二重で守る方針：
-- 30分単位チェックはここで行う（DB制約では複雑になるため）
-- end_time > start_time もここで先にチェックし、分かりやすいエラーメッセージを返す
 """
 from datetime import date, time, datetime
 from typing import Optional, List
@@ -13,6 +9,7 @@ from pydantic import BaseModel, EmailStr, ConfigDict, field_validator, model_val
 from app.models.models import (
     LaneStatusEnum, CheckInStatusEnum, AttendanceStatusEnum,
     PayerTypeEnum, PaymentTimingEnum, PaymentMethodEnum, ItemTypeEnum,
+    InstructorTypeEnum,
 )
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -85,9 +82,6 @@ class ReservationCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_not_past(self):
-        """3-2修正: 日付のみでなく、date+start_timeを結合してJSTで比較する。
-        従来は date < date.today()（サーバーのタイムゾーン依存・時刻無視）だったため、
-        「今日の日付だが現在時刻より前のstart_time」の予約が素通りしていた。"""
         reservation_start = datetime.combine(self.date, self.start_time, tzinfo=JST)
         if reservation_start < datetime.now(JST):
             raise ValueError("過去の日時には予約できません")
@@ -111,11 +105,6 @@ class ReservationOut(BaseModel):
 
 
 class ReservationUpdate(BaseModel):
-    """予約変更(3-2)。部分更新(未指定項目は変更しない)。
-    reservation_type=classの予約は、ClassSessionとの整合性が崩れるため
-    このスキーマ・対応APIでは変更不可(ルーター側でreservation_typeを見て拒否する)。
-    end_time > start_time のチェックは、既存値との組み合わせになるため
-    ここではなくエンドポイント側で行う(片方だけ指定されるケースがあるため)。"""
     lane_set_id: Optional[str] = None
     date: Optional[date] = None
     start_time: Optional[time] = None
@@ -129,12 +118,6 @@ class ReservationUpdate(BaseModel):
         if v.minute not in (0, 30) or v.second != 0:
             raise ValueError("予約時間は30分単位で指定してください（例: 10:00, 10:30）")
         return v
-
-    # 過去日時チェックは削除(3-2修正)。
-    # 部分更新のため date/start_time のどちらかが未指定の場合があり、
-    # スキーマ単体では「変更後の実際の日時」を組み立てられない。
-    # 既存値とのマージ後、エンドポイント側(reservations.py の update_reservation)で
-    # date+start_time を結合しJSTで判定する。
 
 
 # ---------- LaneSet ----------
@@ -159,7 +142,57 @@ class LaneSetStatusUpdate(BaseModel):
         return v
 
 
-# ---------- ClassCourse (第二弾で追加) ----------
+# ---------- Instructor（第三弾拡張②：新設） ----------
+
+class InstructorCreate(BaseModel):
+    name: str
+    instructor_type: InstructorTypeEnum = InstructorTypeEnum.staff
+    staff_id: Optional[int] = None  # 店舗スタッフ兼務の場合のみ指定
+    contact_info: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_staff_id_consistency(self):
+        # 店舗スタッフ兼務(staff)の場合のみ staff_id を必須とする。
+        # 外部プロ・臨時は Staff と無関係に存在できるため staff_id を持たせない。
+        if self.instructor_type == InstructorTypeEnum.staff and self.staff_id is None:
+            raise ValueError("instructor_type='staff' の場合、staff_id の指定が必要です")
+        if self.instructor_type != InstructorTypeEnum.staff and self.staff_id is not None:
+            raise ValueError("instructor_type='staff' 以外では staff_id を指定できません")
+        return self
+
+
+class InstructorOut(BaseModel):
+    id: int
+    name: str
+    instructor_type: InstructorTypeEnum
+    staff_id: Optional[int] = None
+    contact_info: Optional[str] = None
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class InstructorActiveUpdate(BaseModel):
+    is_active: bool
+
+
+class CourseInstructorAssign(BaseModel):
+    """コース単位でのインストラクター割当（第三弾拡張②の中心機能）"""
+    instructor_id: int
+
+
+class SessionInstructorAssign(BaseModel):
+    """開催回単位での担当上書き（代打対応）。Noneを指定するとコースの担当に戻す。"""
+    instructor_id: Optional[int] = None
+
+
+class SessionNoteUpdate(BaseModel):
+    """開催回全体の運営メモ更新（欠席理由・スライド判断・代打対応等を集約）"""
+    session_note: Optional[str] = None
+
+
+# ---------- ClassCourse ----------
 
 class ClassCourseCreate(BaseModel):
     lane_set_id: str
@@ -169,7 +202,7 @@ class ClassCourseCreate(BaseModel):
     first_date: date
     session_count: int = 5
     capacity: int = 10
-    instructor_name: str
+    instructor_id: Optional[int] = None  # 第三弾拡張②: instructor_name(文字列)から置き換え
 
     @field_validator("day_of_week")
     @classmethod
@@ -213,13 +246,6 @@ class ClassCourseCreate(BaseModel):
             raise ValueError("capacity must be greater than 0")
         return v
 
-    @field_validator("instructor_name")
-    @classmethod
-    def validate_instructor_name(cls, v):
-        if not v.strip():
-            raise ValueError("instructor_name must not be empty")
-        return v
-
 
 class ClassCourseOut(BaseModel):
     course_id: int
@@ -230,7 +256,8 @@ class ClassCourseOut(BaseModel):
     first_date: date
     session_count: int
     capacity: int
-    instructor_name: str
+    instructor_id: Optional[int] = None
+    instructor_name: Optional[str] = None  # 第二弾向け表示用。Instructorから解決してルーター側で埋める
     status: str
     enrolled_count: Optional[int] = None
 
@@ -238,7 +265,7 @@ class ClassCourseOut(BaseModel):
         from_attributes = True
 
 
-# ---------- ClassSession (第二弾で追加、第三弾でlane_pairを拡張) ----------
+# ---------- ClassSession ----------
 
 class ClassSessionOut(BaseModel):
     class_session_id: int
@@ -248,7 +275,9 @@ class ClassSessionOut(BaseModel):
     start_time: time
     end_time: time
     status: str
-    lane_pair: Optional[int] = None  # 第三弾で追加: 先頭レーン番号方式
+    lane_pair: Optional[int] = None
+    instructor_id: Optional[int] = None  # 第三弾拡張②
+    session_note: Optional[str] = None  # 第三弾拡張②
 
     class Config:
         from_attributes = True
@@ -265,7 +294,7 @@ class ClassSessionStatusUpdate(BaseModel):
         return v
 
 
-# ---------- ClassEnrollment (第二弾で追加) ----------
+# ---------- ClassEnrollment ----------
 
 class ClassEnrollmentCreate(BaseModel):
     course_id: int
@@ -283,7 +312,7 @@ class ClassEnrollmentOut(BaseModel):
         from_attributes = True
 
 
-# ---------- Group Reservation (クラウドファンディング特典＝レーン貸し切り用。第二弾で追加) ----------
+# ---------- Group Reservation ----------
 
 class GroupReservationCreate(BaseModel):
     lane_set_id: str
@@ -339,7 +368,7 @@ class GroupReservationOut(BaseModel):
         from_attributes = True
 
 
-# ---------- ClassGroupEnrollment (教室への団体申込＝職場単位など。第二弾で追加) ----------
+# ---------- ClassGroupEnrollment ----------
 
 class ClassGroupEnrollmentCreate(BaseModel):
     contact_name: str
@@ -370,10 +399,6 @@ class ClassGroupEnrollmentOut(BaseModel):
         from_attributes = True
 
 
-# =====================================================================
-# 【第三弾 Phase3-1 新規追加】
-# =====================================================================
-
 # ---------- Lane ----------
 
 class LaneBase(BaseModel):
@@ -384,7 +409,7 @@ class LaneBase(BaseModel):
     notes: Optional[str] = None
 
 
-class LaneStatusUpdate(BaseModel):
+class LaneStatusUpdateP3(BaseModel):
     status: LaneStatusEnum
     notes: Optional[str] = None
 
@@ -397,9 +422,9 @@ class LaneRead(LaneBase):
 # ---------- ClassAttendance ----------
 
 class ClassAttendanceCreate(BaseModel):
+    """第三弾拡張②: absent_noteは廃止(ClassSession.session_noteに統合したため)"""
     class_session_id: int
     attendance_status: AttendanceStatusEnum
-    absent_note: Optional[str] = None
 
 
 class ClassAttendanceRead(ClassAttendanceCreate):
@@ -407,13 +432,9 @@ class ClassAttendanceRead(ClassAttendanceCreate):
     model_config = ConfigDict(from_attributes=True)
 
 
-# ---------- レーンアサイン変更(3-2) ----------
-# 3-1のGenerateClassSessionsRequest/Responseは廃止(新規INSERT前提だったため)。
-# コース作成時(class_courses.py)に既に5セッションが生成済みという実態に合わせ、
-# lane_pairの一括/個別UPDATE用スキーマに置き換える。
+# ---------- レーンアサイン変更 ----------
 
 class LanePairUpdate(BaseModel):
-    """個別セッションのlane_pair変更用(先頭レーン番号方式: 1,3,5...)"""
     lane_pair: int
 
     @field_validator("lane_pair")
@@ -425,7 +446,6 @@ class LanePairUpdate(BaseModel):
 
 
 class AssignLanePairRequest(BaseModel):
-    """コース単位でのlane_pair一括設定・更新用"""
     lane_pair: int
 
     @field_validator("lane_pair")
@@ -545,11 +565,11 @@ class DashboardResponse(BaseModel):
     today_class_sessions: List[DashboardClassSessionRead]
 
 
-# ---------- Staff (グループC・Claude担当) ----------
+# ---------- Staff ----------
 
 class StaffCreate(BaseModel):
     name: str
-    pin_code: str  # 生の4桁PIN。保存時にAPI層でハッシュ化してpin_hashに変換する
+    pin_code: str
 
     @field_validator("name")
     @classmethod
@@ -592,7 +612,5 @@ class StaffActiveUpdate(BaseModel):
 
 
 class StaffToken(BaseModel):
-    """既存Tokenと型は同じだが、payloadのclaimキーが異なるため別スキーマとして分離
-    (詳細はapp/utils/staff_auth.py参照)"""
     access_token: str
     token_type: str = "bearer"

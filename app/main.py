@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from sqlalchemy.orm import Session
-
+from app.routers import instructors
 from app.database import Base, engine, SessionLocal
 from app.models.models import LaneSet, Lane, LaneStatusEnum
 from app.routers import (
@@ -69,7 +69,7 @@ app.include_router(checkin.router, prefix="/api/v1/checkins", tags=["checkins"])
 app.include_router(class_management.router, prefix="/api/v1", tags=["class-management"])
 app.include_router(payments.router, prefix="/api/v1/payments", tags=["payments"])
 app.include_router(staff.router)  # staff.router 側で prefix="/api/v1/staff" を既に設定済み
-
+app.include_router(instructors.router)
 
 @app.get("/")
 def root():

@@ -1,18 +1,12 @@
 """
 DBモデル定義
 
-設計方針（レビューで確定した内容）：
-- Users.role: user / competitor / admin（要件定義Ver.2準拠）
-- LaneSet: MVPではセット単位の状態管理のみ（個別レーン管理はPhase2）
-- Reservation: reservation_type（システム区分）のみMVP対象。purposeは対象外
-- status は論理削除方式（reserved / cancelled）。物理削除は行わない
-
-【第三弾 Phase3-1 追記】
-- User と staff（別ファイル app/models/staff.py）は別テーブル
-- LaneSet は変更せず維持。個別レーン管理は本ファイル末尾の Lane で追加
-- ClassSession は置き換えず拡張（lane_pair カラムを追加）
-- class_group は新設しない。ClassCourse / ClassEnrollment / ClassGroupEnrollment で代替
-- lane_pair は先頭レーン番号方式（1→1・2番, 3→3・4番, 5→5・6番）
+【第三弾拡張② 追記(コーチシフト管理×指導メモ)】
+- 「シフト管理」は勤務スケジュール調整ではなく「教室コース/回への担当インストラクター割当」の意味。
+- Instructor を新設。店舗スタッフ兼務(staff_id 経由でStaffに紐づく)/外部プロ/臨時の3種別に対応。
+- ClassCourse.instructor_name(自由記述文字列)は廃止し、instructor_id(FK→Instructor)に置き換え。
+- ClassSession に instructor_id(nullable、代打対応用)と session_note(開催回全体の運営メモ)を追加。
+- ClassAttendance.absent_note は廃止し、ClassSession.session_note に統合。
 """
 import enum
 from sqlalchemy import (
@@ -43,10 +37,8 @@ class User(Base):
 class LaneSet(Base):
     __tablename__ = "lane_sets"
 
-    # 例: 'A', 'B'
     lane_set_id = Column(String(10), primary_key=True)
     name = Column(String(50), nullable=False)
-    # MVPではセット単位の状態管理のみ（個別レーンの故障管理はPhase2で Lanes テーブルを分離）
     status = Column(String(20), nullable=False, default="available")
 
     __table_args__ = (
@@ -67,7 +59,6 @@ class Reservation(Base):
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
 
-    # システム管理用区分。class(初心者教室)は将来拡張だが値としては予約しておく
     reservation_type = Column(String(30), nullable=False, default="general")
     status = Column(String(20), nullable=False, default="reserved")
 
@@ -85,18 +76,19 @@ class Reservation(Base):
 
 
 class ClassCourse(Base):
-    """教室コース全体（全5回セット）。第二弾で追加。"""
+    """教室コース全体（全5回セット）。
+    【第三弾拡張②】instructor_name(自由記述文字列)を廃止し、instructor_id(FK)に置き換え。"""
     __tablename__ = "class_courses"
 
     course_id = Column(Integer, primary_key=True, autoincrement=True)
     lane_set_id = Column(String(10), ForeignKey("lane_sets.lane_set_id"), nullable=False, index=True)
-    day_of_week = Column(String(10), nullable=False)  # 'monday'...'sunday'
+    day_of_week = Column(String(10), nullable=False)
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
     first_date = Column(Date, nullable=False)
     session_count = Column(Integer, nullable=False, default=5)
     capacity = Column(Integer, nullable=False, default=10)
-    instructor_name = Column(String(100), nullable=False)
+    instructor_id = Column(Integer, ForeignKey("instructors.id"), nullable=True)
     status = Column(String(20), nullable=False, default="scheduled")
 
     __table_args__ = (
@@ -109,11 +101,12 @@ class ClassCourse(Base):
     lane_set = relationship("LaneSet")
     sessions = relationship("ClassSession", back_populates="course")
     enrollments = relationship("ClassEnrollment", back_populates="course")
+    instructor = relationship("Instructor")
 
 
 class ClassSession(Base):
-    """コースから自動生成される各回（session_number 1〜N）。第二弾で追加。
-    【第三弾で拡張】lane_pair を追加（先頭レーン番号方式）。既存カラムは変更なし。"""
+    """コースから自動生成される各回（session_number 1〜N）。
+    【第三弾拡張②】instructor_id(代打対応用、nullable)とsession_note(運営メモ)を追加。"""
     __tablename__ = "class_sessions"
 
     class_session_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -123,7 +116,9 @@ class ClassSession(Base):
     start_time = Column(Time, nullable=False)
     end_time = Column(Time, nullable=False)
     status = Column(String(20), nullable=False, default="scheduled")
-    lane_pair = Column(Integer, nullable=True)  # 追加分: 1→1・2番, 3→3・4番, 5→5・6番
+    lane_pair = Column(Integer, nullable=True)
+    instructor_id = Column(Integer, ForeignKey("instructors.id"), nullable=True)
+    session_note = Column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN ('scheduled','cancelled')", name="ck_session_status"),
@@ -131,10 +126,10 @@ class ClassSession(Base):
     )
 
     course = relationship("ClassCourse", back_populates="sessions")
+    instructor = relationship("Instructor")
 
 
 class ClassEnrollment(Base):
-    """生徒の申込。コース単位（1回申込で全セッション分参加扱い）。第二弾で追加。"""
     __tablename__ = "class_enrollments"
 
     enrollment_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -153,8 +148,6 @@ class ClassEnrollment(Base):
 
 
 class GroupReservationDetail(Base):
-    """クラウドファンディング特典（レーン貸し切り等）用の予約追加情報。
-    教室・団体練習とは無関係の、特典利用者向けレーン貸し切り予約。第二弾で追加。"""
     __tablename__ = "group_reservation_details"
 
     detail_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -168,8 +161,6 @@ class GroupReservationDetail(Base):
 
 
 class ClassGroupEnrollment(Base):
-    """教室コースへの団体申込（職場単位など）。人数上限なし。第二弾で追加。
-    個人申込(ClassEnrollment)とは別枠で扱い、定員(capacity)のチェック対象にしない。"""
     __tablename__ = "class_group_enrollments"
 
     group_enrollment_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -188,12 +179,6 @@ class ClassGroupEnrollment(Base):
 
     course = relationship("ClassCourse")
 
-
-# =====================================================================
-# 【第三弾 Phase3-1 新規追加】
-# =====================================================================
-
-# --- Enum定義 ---
 
 class LaneStatusEnum(str, enum.Enum):
     available = "available"
@@ -215,8 +200,6 @@ class AttendanceStatusEnum(str, enum.Enum):
 
 
 class PayerTypeEnum(str, enum.Enum):
-    # 修正: 「class_group」テーブルは新設しない方針のため、メンバー名を course に変更
-    # (値"class"自体は憲法7章の確定値のまま変更なし)
     course = "class"
     checkin = "checkin"
 
@@ -240,32 +223,28 @@ class ItemTypeEnum(str, enum.Enum):
     class_fee = "class"
 
 
-# --- 新規モデルクラス ---
-
 class Lane(Base):
-    """個別レーン管理。既存 LaneSet は変更せず維持し、lane_set_id で紐付ける。"""
     __tablename__ = "lanes"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     lane_set_id = Column(String(10), ForeignKey("lane_sets.lane_set_id"), nullable=False)
     lane_number = Column(Integer, nullable=False, unique=True)
-    pair_number = Column(Integer, nullable=False)  # ペア識別番号 (1番,2番->1 / 3番,4番->2)
+    pair_number = Column(Integer, nullable=False)
     status = Column(Enum(LaneStatusEnum), default=LaneStatusEnum.available, nullable=False)
     notes = Column(Text, nullable=True)
 
 
 class ClassAttendance(Base):
-    """教室出欠。既存 class_sessions.class_session_id にFK。グループ単位で記録。"""
+    """教室出欠。グループ単位で記録。
+    【第三弾拡張②】absent_noteは廃止(ClassSession.session_noteに統合)。"""
     __tablename__ = "class_attendance"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     class_session_id = Column(Integer, ForeignKey("class_sessions.class_session_id"), nullable=False)
     attendance_status = Column(Enum(AttendanceStatusEnum), nullable=False)
-    absent_note = Column(Text, nullable=True)
 
 
 class CheckIn(Base):
-    """来店受付・利用管理。"""
     __tablename__ = "checkin"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -280,7 +259,6 @@ class CheckIn(Base):
 
 
 class Payment(Base):
-    """決済。payer_type=course のとき course_id、checkin のとき checkin_id を使用。"""
     __tablename__ = "payment"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -295,7 +273,6 @@ class Payment(Base):
 
 
 class PricingRule(Base):
-    """料金マスタ。時間単価制(1ゲーム単位ではない)。"""
     __tablename__ = "pricing_rule"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -304,13 +281,7 @@ class PricingRule(Base):
 
 
 class Staff(Base):
-    """スタッフ管理(グループC・Claude担当)。
-    Userとは完全に別テーブル・別ドメイン(お客様認証 vs スタッフ認証)。
-    pin_codeは平文で保持せず、bcryptハッシュ化してpin_hashに保持する
-    (既存Userのpassword_hashと同じ設計思想に統一)。
-    階層管理なし(role等のカラムを持たない)。少人数運営・簡易PIN認証の方針。
-    コーチのシフト管理(coach_shift等)はPhase3-2のため本ファイルには含まない。
-    """
+    """スタッフ管理。Userとは完全に別テーブル・別ドメイン。階層管理なし。"""
     __tablename__ = "staff"
 
     staff_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -318,3 +289,25 @@ class Staff(Base):
     pin_hash = Column(String(255), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, server_default=func.now())
+
+
+class InstructorTypeEnum(str, enum.Enum):
+    staff = "staff"
+    external = "external"
+    temporary = "temporary"
+
+
+class Instructor(Base):
+    """初心者教室のインストラクター(第三弾拡張②)。
+    店舗スタッフ兼務の場合のみstaff_idでStaffと紐づく。外部プロ・臨時はStaffと独立に存在できる。"""
+    __tablename__ = "instructors"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    name = Column(String(100), nullable=False)
+    instructor_type = Column(Enum(InstructorTypeEnum), nullable=False, default=InstructorTypeEnum.staff)
+    staff_id = Column(Integer, ForeignKey("staff.staff_id"), nullable=True)
+    contact_info = Column(String(255), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+
+    staff = relationship("Staff")

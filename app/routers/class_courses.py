@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.models import (
-    ClassCourse, ClassSession, ClassEnrollment, ClassGroupEnrollment, Reservation, LaneSet, User,
+    ClassCourse, ClassSession, ClassEnrollment, ClassGroupEnrollment, Reservation, LaneSet, User, Instructor,
 )
 from app.schemas.schemas import (
     ClassCourseCreate, ClassCourseOut, ClassSessionOut, ClassEnrollmentOut,
@@ -48,6 +48,18 @@ def _enrolled_count(db: Session, course_id: int) -> int:
         .filter(ClassEnrollment.course_id == course_id, ClassEnrollment.status == "enrolled")
         .count()
     )
+
+
+def _to_course_out(db: Session, course: ClassCourse) -> ClassCourseOut:
+    """第三弾拡張②: instructor_id からインストラクター名を解決し、
+    ClassCourseOut.instructor_name に埋める(第二弾のフロントが従来通り文字列で
+    表示名を受け取れるようにするため。第二弾側のコード変更は不要)。"""
+    result = ClassCourseOut.model_validate(course)
+    if course.instructor_id is not None:
+        instructor = db.query(Instructor).filter(Instructor.id == course.instructor_id).first()
+        result.instructor_name = instructor.name if instructor else None
+    result.enrolled_count = _enrolled_count(db, course.course_id)
+    return result
 
 
 @router.post("", response_model=ClassCourseOut, status_code=status.HTTP_201_CREATED)
@@ -98,7 +110,7 @@ def create_class_course(
             first_date=payload.first_date,
             session_count=payload.session_count,
             capacity=payload.capacity,
-            instructor_name=payload.instructor_name,
+            instructor_id=payload.instructor_id,
             status="scheduled",
         )
         db.add(course)
@@ -129,8 +141,7 @@ def create_class_course(
         db.commit()
         db.refresh(course)
 
-    result = ClassCourseOut.model_validate(course)
-    result.enrolled_count = 0
+    result = _to_course_out(db, course)
     return result
 
 
@@ -139,9 +150,7 @@ def list_class_courses(db: Session = Depends(get_db)):
     courses = db.query(ClassCourse).filter(ClassCourse.status == "scheduled").all()
     out = []
     for c in courses:
-        item = ClassCourseOut.model_validate(c)
-        item.enrolled_count = _enrolled_count(db, c.course_id)
-        out.append(item)
+        out.append(_to_course_out(db, c))
     return out
 
 
