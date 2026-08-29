@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.models import Lane
-from app.schemas.schemas import LaneRead, LaneStatusUpdate
+from app.schemas.schemas import LaneRead, LaneStatusUpdateP3 as LaneStatusUpdate
 
 router = APIRouter()
 
